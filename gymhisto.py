@@ -31,9 +31,19 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import gym
 from gym import spaces
+
 import openslide
 from openslide.deepzoom import DeepZoomGenerator
 from utils import coordination as Coor
+
+# --- ProstateX Imports ---
+import SimpleITK as sitk
+from prostatex_dataset import ProstateXDataset
+from fusion_module import MultimodalFusion
+from attention_module import SpatialAttention, IntegratedFusionAttention
+import torch
+# -------------------------
+
 
 class HistoEnv(gym.Env):
     """
@@ -91,6 +101,7 @@ class HistoEnv(gym.Env):
     """
 
 
+
     # Define Actions: 
     UP = 0
     DOWN = 1
@@ -100,21 +111,51 @@ class HistoEnv(gym.Env):
     ZOOM_OUT = 5
     STAY = 6
 
+    # --- ProstateX Actions ---
+    SLICE_UP = 7
+    SLICE_DOWN = 8
+    # -------------------------
 
-    def __init__(self, img_path, xml_path, tile_size , result_path):
+
+
+
+    def __init__(self, img_path, xml_path, tile_size , result_path, mode="histogym", prostatex_data_dir=None, prostatex_metadata=None):
         super(HistoEnv, self).__init__()
+        self.mode = mode
         
-        # 1.Init Args 
+        # --- Common args ---
         self.img_path = img_path
-        self.xml_path = xml_path  # self.mask, self.dz_mask, 
+        self.xml_path = xml_path
         self.tile_size = tile_size
         self.result_path = result_path
-        
         self.plt_size = 10
-        self.slide = openslide.OpenSlide(img_path)
+        self.max_step = 2000
+        self.count = 0
+        self.state = None
+        self.OBS_W, self.OBS_H = self.tile_size, self.tile_size
+
+        if self.mode == "histogym":
+            self._init_histogym()
+        elif self.mode == "prostatex":
+            self.prostatex_data_dir = prostatex_data_dir
+            self.prostatex_metadata = prostatex_metadata
+            self._init_prostatex()
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+        try:
+            if not os.path.exists(self.result_path):
+                os.makedirs(self.result_path)
+        except OSError as e:
+            print(e)
+            import sys
+            sys.exit(1)
+
+
+    def _init_histogym(self):
+        self.slide = openslide.OpenSlide(self.img_path)
         self.dz = DeepZoomGenerator(osr=self.slide, tile_size=self.tile_size, overlap=1, limit_bounds=False)
         self.dz_level = self._get_init_position()[0]
-        self.OBS_W, self.OBS_H = self.tile_size, self.tile_size
         self.STATE_W, self.STATE_H = self._get_state_wh() 
         
         # Annotaions
@@ -131,209 +172,407 @@ class HistoEnv(gym.Env):
         self.agent_pos = self._get_init_position() #(z,x,y)
         self.STATE_D = self._get_init_position()[0] # minial level, for set bound
         print(self.STATE_D)
-        self.state = None
-        self.count = 0 # count step within episode
-        self.max_step = 2000
         self.bound = self._get_all_bound()
+    def _init_prostatex(self):
+        print("Initializing ProstateX Environment...")
+        self.dataset = ProstateXDataset(self.prostatex_data_dir, self.prostatex_metadata)
+
+        # Load patient data
+        patient_ids = [d for d in os.listdir(self.prostatex_data_dir) if os.path.isdir(os.path.join(self.prostatex_data_dir, d))]
+        if not patient_ids:
+            raise FileNotFoundError("No patients found in ProstateX data dir")
+        self.patient_id = patient_ids[0]
+        self._load_patient(self.patient_id)
+
+        self.n_actions = 9  # Added SLICE_UP and SLICE_DOWN
+        self.action_space = spaces.Discrete(self.n_actions)
+
+        # Models
+        self.fusion_module = MultimodalFusion(in_channels=3, base_filters=16, out_features=128, is_3d=False)
+        self.attention_module = SpatialAttention(in_channels=64, is_3d=False) # 64 is base_filters*4
+        self.integrated_model = IntegratedFusionAttention(self.fusion_module, self.attention_module)
+        self.integrated_model.eval()
+
+        # Observation is the fused feature vector
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(128,), dtype=np.float32)
+
+        self.step_size = 10 # Example step size in pixels
+
+        # Position: [slice_index, x, y]
+        center_z = self.volume.shape[1] // 2
+        center_y = self.volume.shape[2] // 2
+        center_x = self.volume.shape[3] // 2
+        self.agent_pos = [center_z, center_x, center_y]
+
+        # Settings
+        self.uncertainty_weight = 0.1
+        self.visited_locations = set()
+        self.trajectory = []
+        self.current_attention_map = None
+
+    def _load_patient(self, patient_id):
+        self.volume, self.lesions, self.img_info = self.dataset.get_patient_data(patient_id)
+        self.max_z = self.volume.shape[1] - 1
+        self.max_y = self.volume.shape[2] - 1
+        self.max_x = self.volume.shape[3] - 1
+
+
+
         
-        try:
-            if not os.path.exists(self.result_path):
-                os.makedirs(self.result_path)
-        except OSError as e:
-            print(e)
-            sys.exit(1)
         
-        # Print Args 
-        print("\n###########################################################################\
-                \nimage path: %s\
-                \nxml path: %s\
-                \nimage save path : %s \
-                \nObservation size : (%s, %s) \
-                " %(self.img_path,self.xml_path, self.result_path,self.OBS_W,self.OBS_H))
-        print("Initial DeepZoom Level : %s \
-                \nInitial Stat Size : (%s, %s)  \
-                \nMin Level : %s  \
-                \nInit Position : %s  \
-                \n##########################################################################\n \
-                "% (self.dz_level,  self.STATE_W, self.STATE_H, self.STATE_D,self.agent_pos))
 
 
     def reset(self):
-        """
-        Important: The observation returned by `reset()` method must be a numpy array
-        the observation is PIL (STATE_H, STATE_W, 3)
-        :return: 
-        """
-        print("HistoEnv Reset!... Time Step is %s" % self.count) #debug
-        # Initialize the agent at the center of the tile image grid
-        self.agent_pos = self._get_init_position() #(z,x,y)
-        self.state = self._get_state()
-        self.bound = self._get_all_bound()
-        #return self.agent_pos
         self.count = 0
-        return self.state
+
+        if self.mode == "histogym":
+            self.agent_pos = self._get_init_position() #(z,x,y)
+            self.state = self._get_state()
+            self.bound = self._get_all_bound()
+            return self.state
+        elif self.mode == "prostatex":
+            self.visited_locations = set()
+            self.trajectory = []
+
+            center_z = self.volume.shape[1] // 2
+            center_y = self.volume.shape[2] // 2
+            center_x = self.volume.shape[3] // 2
+            self.agent_pos = [center_z, center_x, center_y]
+
+            self.state, self.current_attention_map = self._get_state_prostatex()
+            return self.state
+
 
     def step(self,action):#action, agent_pos, n=1, tile_size = tile_size, init_z = init_z, plot = True
-        n = 1
-        agent_pos = self.agent_pos
-        tile_size = self.tile_size
-        self.count +=1
-        if action == self.UP:
-            #print("GO UP...")
-            #print(agent_pos)
+        if self.mode == "histogym":
+            return self._step_histogym(action)
+        elif self.mode == "prostatex":
+            return self._step_prostatex(action)
             
-            # ALmost Reach the Boundary
-            if agent_pos[2] < 1 : #and agent_pos[2] >= 0:
-                agent_pos[2] = 0
-            #if type(agent_pos[2])!= int:
-                #agent_pos[2] = math.floor(agent_pos[2])
-                #print(agent_pos)  
-            else:
-                agent_pos[2] -= 1
-                agent_pos[2] = round(agent_pos[2],2)
+    def _step_histogym(self, action):
+
+            n = 1
+            agent_pos = self.agent_pos
+            tile_size = self.tile_size
+            self.count +=1
+            if action == self.UP:
+                #print("GO UP...")
+                #print(agent_pos)
+
+                # ALmost Reach the Boundary
+                if agent_pos[2] < 1 : #and agent_pos[2] >= 0:
+                    agent_pos[2] = 0
+                #if type(agent_pos[2])!= int:
+                    #agent_pos[2] = math.floor(agent_pos[2])
+                    #print(agent_pos)
+                else:
+                    agent_pos[2] -= 1
+                    agent_pos[2] = round(agent_pos[2],2)
+
+                    #print(agent_pos)
+            if action == self.DOWN:
+                #print("GO DOWN...")
+                # Almost Reach bound and tile is not rectangle:
+                if agent_pos[2] + 1 >= self._get_bound()[2]:
+                    agent_pos[2] = self._get_bound()[2]
+                    #down_tile = self._get_state()
+                    down_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
+                    if down_tile.size[1]<tile_size:
+                        agent_pos[2] = round(agent_pos[2] -((tile_size-down_tile.size[1])/tile_size),2)
+                elif agent_pos[2] + 2 > self._get_bound()[2]:
+                    agent_pos[2] += 1
+                    down_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
+                    if down_tile.size[1]<tile_size:
+                        agent_pos[2] = round(agent_pos[2] -((tile_size-down_tile.size[1])/tile_size),2)
+                else:
+                    agent_pos[2] += 1
+                    agent_pos[2] = round(agent_pos[2],2)
+            if action == self.LEFT:
+                #print("GO LEFT...")
+
+                # ALmost Reach the Boundary
+                if agent_pos[1] < 1: # and agent_pos[1] >=0:
+                    agent_pos[1] = 0
+                else:
+                    agent_pos[1] -= 1
+                    agent_pos[1] = round(agent_pos[1],2)
+
+
+            if action == self.RIGHT:
+                #print("GO RIGHT...")
+                # Almost Reach bound and tile is not rectangle:
+                if agent_pos[1] + 1 >= self._get_bound()[1]:
+                    agent_pos[1] = self._get_bound()[1]
+                    # right_tile = self._get_state()
+                    right_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2])) #TODO _get_all_tile_size() avoid load tile
+                    if right_tile.size[0]<tile_size:
+                        agent_pos[1] = round(agent_pos[1] -((tile_size-right_tile.size[0])/tile_size),2)
+                elif agent_pos[1] + 2 > self._get_bound()[1]:
+                    agent_pos[1] += 1
+                    right_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
+                    if right_tile.size[0]<tile_size:
+                        agent_pos[1] = round(agent_pos[1] -((tile_size-right_tile.size[0])/tile_size),2)
+                else:
+                    agent_pos[1] += 1
+                    agent_pos[1] = round(agent_pos[1],2)
                 
-                #print(agent_pos)  
-        if action == self.DOWN:        
-            #print("GO DOWN...")            
-            # Almost Reach bound and tile is not rectangle:
-            if agent_pos[2] + 1 >= self._get_bound()[2]:
-                agent_pos[2] = self._get_bound()[2]
-                #down_tile = self._get_state()
-                down_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
-                if down_tile.size[1]<tile_size:
-                    agent_pos[2] = round(agent_pos[2] -((tile_size-down_tile.size[1])/tile_size),2)
-            elif agent_pos[2] + 2 > self._get_bound()[2]:
-                agent_pos[2] += 1
-                down_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
-                if down_tile.size[1]<tile_size:
-                    agent_pos[2] = round(agent_pos[2] -((tile_size-down_tile.size[1])/tile_size),2)
-            else:
-                agent_pos[2] += 1
-                agent_pos[2] = round(agent_pos[2],2)
-        if action == self.LEFT:
-            #print("GO LEFT...")
-            
-            # ALmost Reach the Boundary
-            if agent_pos[1] < 1: # and agent_pos[1] >=0:
-                agent_pos[1] = 0
-            else:
-                agent_pos[1] -= 1
-                agent_pos[1] = round(agent_pos[1],2)
- 
     
-        if action == self.RIGHT:
-            #print("GO RIGHT...")
-            # Almost Reach bound and tile is not rectangle:
-            if agent_pos[1] + 1 >= self._get_bound()[1]:
-                agent_pos[1] = self._get_bound()[1]
-                # right_tile = self._get_state()
-                right_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2])) #TODO _get_all_tile_size() avoid load tile
-                if right_tile.size[0]<tile_size:
-                    agent_pos[1] = round(agent_pos[1] -((tile_size-right_tile.size[0])/tile_size),2)
-            elif agent_pos[1] + 2 > self._get_bound()[1]:
-                agent_pos[1] += 1
-                right_tile = self.dz.get_tile(agent_pos[0],(agent_pos[1],agent_pos[2]))
-                if right_tile.size[0]<tile_size:
-                    agent_pos[1] = round(agent_pos[1] -((tile_size-right_tile.size[0])/tile_size),2)
-            else:
-                agent_pos[1] += 1
-                agent_pos[1] = round(agent_pos[1],2)
+            if action == self.ZOOM_IN:
+                """
+                NOTE: ouput is fractional
+                Example:
+                    input : [11,2,3]
+                    output: [12, 4.5, 6.5]
+                """
+                #print("ZOOM IN...")
+                if agent_pos[0] < self._get_bound()[0]:
+                    pos_in = self._get_pos_in()
+                    if pos_in[1]> self.bound[pos_in[0]][0]:
+                        pos_in[1] = self.bound[pos_in[0]][0]
+                    if pos_in[2] > self.bound[pos_in[0]][1]:
+                        pos_in[2] = self.bound[pos_in[0]][1]
+                    agent_pos = pos_in
+
+
+                else:
+                    agent_pos = agent_pos
             
+            if action == self.ZOOM_OUT:
+                """
+                NOTE: ouput is fractional
+                Example:
+                    input : [11,2,3]
+                    output: [10,x.5]
+                """
+                #print("ZOOM OUT...")
+                init_z = self._get_init_position()[0]
+                if agent_pos[0] > init_z:
+                    pos_out = self._get_pos_out()
+                    if pos_out[1]<0:
+                        pos_out[1] = 0
+                    if pos_out[2]<0:
+                        pos_out[2] = 0
+                    if pos_out[1]> self.bound[pos_out[0]][0]:
+                        pos_out[1] = self.bound[pos_out[0]][0]
+                    if pos_out[2] > self.bound[pos_out[0]][1]:
+                        pos_out[2] = self.bound[pos_out[0]][1]
+                    agent_pos = pos_out
 
-        if action == self.ZOOM_IN:
-            """
-            NOTE: ouput is fractional
-            Example:
-                input : [11,2,3]
-                output: [12, 4.5, 6.5]
-            """
-            #print("ZOOM IN...")
-            if agent_pos[0] < self._get_bound()[0]: 
-                pos_in = self._get_pos_in()
-                if pos_in[1]> self.bound[pos_in[0]][0]:
-                    pos_in[1] = self.bound[pos_in[0]][0]
-                if pos_in[2] > self.bound[pos_in[0]][1]:
-                    pos_in[2] = self.bound[pos_in[0]][1]
-                agent_pos = pos_in
-                
-
-            else:
+                else:
+                    agent_pos = agent_pos
+            if action == self.STAY:
+                #print("STAY...")
                 agent_pos = agent_pos
+            #self.imshow()
+            agent_pos[2] = round(agent_pos[2],2)
+            agent_pos[1] = round(agent_pos[1],2)
+            self.agent_pos = agent_pos
+            self.state = self._get_state()
+
+            done = False
+
         
-        if action == self.ZOOM_OUT:
-            """
-            NOTE: ouput is fractional
-            Example:
-                input : [11,2,3]
-                output: [10,x.5]
-            """
-            #print("ZOOM OUT...")
-            init_z = self._get_init_position()[0]
-            if agent_pos[0] > init_z:
-                pos_out = self._get_pos_out()
-                if pos_out[1]<0:
-                    pos_out[1] = 0
-                if pos_out[2]<0:
-                    pos_out[2] = 0
-                if pos_out[1]> self.bound[pos_out[0]][0]:
-                    pos_out[1] = self.bound[pos_out[0]][0]
-                if pos_out[2] > self.bound[pos_out[0]][1]:
-                    pos_out[2] = self.bound[pos_out[0]][1]
-                agent_pos = pos_out
-                
+
+            # Calculate Reward
+            if agent_pos[0] == self._get_bound()[0]:
+                self.if_overlap, self.overlap_seg_index, self.overlap_ratio = \
+                        Coor.check_overlap(self.coor_dz_all,agent_pos[0],agent_pos[1],agent_pos[2],self.tile_size)
             else:
-                agent_pos = agent_pos
-        if action == self.STAY:
-            #print("STAY...")
-            agent_pos = agent_pos
-        #self.imshow()
-        agent_pos[2] = round(agent_pos[2],2)
-        agent_pos[1] = round(agent_pos[1],2)
-        self.agent_pos = agent_pos
-        self.state = self._get_state()
+                self.if_overlap, self.overlap_seg_index, self.overlap_ratio = False, None, 0
 
-        done = False
 
+
+            reward = (self.overlap_ratio * 1000) -0.01
+            if self.count >= self.max_step:
+                done = True
+
+            # reward = self.overlap_ratio -0.01
+            # if self.count >= self.max_step:
+            #     done = True
+            # if score > 0.9 and  self.agent_pos[0] > (self.dz.level_count-1-3):
+            #     done = True
     
 
-        # Calculate Reward
-        if agent_pos[0] == self._get_bound()[0]:
-            self.if_overlap, self.overlap_seg_index, self.overlap_ratio = \
-                    Coor.check_overlap(self.coor_dz_all,agent_pos[0],agent_pos[1],agent_pos[2],self.tile_size)
-        else:
-            self.if_overlap, self.overlap_seg_index, self.overlap_ratio = False, None, 0
-            
-            
 
-        reward = (self.overlap_ratio * 1000) -0.01
-        if self.count >= self.max_step:
-            done = True
-        
-        # reward = self.overlap_ratio -0.01
-        # if self.count >= self.max_step:
-        #     done = True
-        # if score > 0.9 and  self.agent_pos[0] > (self.dz.level_count-1-3): 
-        #     done = True
+            # # -0.01 reward every setp except when reaching the goal
+            # reward = 1000 if done==True else -0.01
 
+            # Optionally we can pass additional info, we are not using that for now
+            info = {
+                        "agent position: ":"level %s :(%s,%s)"%(self.agent_pos[0],self.agent_pos[1], self.agent_pos[2])
+                }
 
-
-        # # -0.01 reward every setp except when reaching the goal 
-        # reward = 1000 if done==True else -0.01
-
-        # Optionally we can pass additional info, we are not using that for now
-        info = {
-                    "agent position: ":"level %s :(%s,%s)"%(self.agent_pos[0],self.agent_pos[1], self.agent_pos[2])
-            }
-
-        #return np.array([self.agent_pos]), reward, done, info
-        # print(info, reward) # debug
-        print(info, reward , self.overlap_ratio)  # debug
-        return self.state, reward, done, info
+            #return np.array([self.agent_pos]), reward, done, info
+            # print(info, reward) # debug
+            print(info, reward , self.overlap_ratio)  # debug
+            return self.state, reward, done, info
 
     # # def render(self, mode='console'):
     # #   if mode != 'console':
     # #     raise NotImplementedError()
+
+    def _step_prostatex(self, action):
+        self.count += 1
+
+        # Current Position
+        z, x, y = self.agent_pos
+        step_z = 1
+        step_x = self.step_size
+        step_y = self.step_size
+
+        if action == self.UP:
+            y = max(0, y - step_y)
+        elif action == self.DOWN:
+            y = min(self.max_y, y + step_y)
+        elif action == self.LEFT:
+            x = max(0, x - step_x)
+        elif action == self.RIGHT:
+            x = min(self.max_x, x + step_x)
+        elif action == self.SLICE_UP:
+            z = min(self.max_z, z + step_z)
+        elif action == self.SLICE_DOWN:
+            z = max(0, z - step_z)
+        elif action == self.STAY:
+            pass
+
+        self.agent_pos = [z, x, y]
+        self.trajectory.append(tuple(self.agent_pos))
+
+        # Get State (Fused Features)
+        self.state, self.current_attention_map = self._get_state_prostatex()
+
+        # Calculate Reward
+        overlap_score, clinical_score = self._calculate_prostatex_scores(self.agent_pos)
+
+        # Duplicate region penalty
+        duplicate_penalty = 0.0
+        pos_tuple = tuple(self.agent_pos)
+        if pos_tuple in self.visited_locations:
+            duplicate_penalty = 5.0
+        else:
+            self.visited_locations.add(pos_tuple)
+            
+        uncertainty_score = getattr(self, "current_uncertainty", 0.0)
+        step_penalty = 1.0
+
+        reward = (overlap_score * 500) + (clinical_score * 500) - step_penalty - duplicate_penalty
+        reward += self.uncertainty_weight * uncertainty_score
+
+        # Check termination
+        done = False
+        if self.count >= self.max_step:
+            done = True
+
+        info = {
+            'overlap_score': overlap_score,
+            'clinical_score': clinical_score,
+            'position': self.agent_pos
+        }
+        
+        return self.state, reward, done, info
+
+    def _get_state_prostatex(self):
+        z, x, y = self.agent_pos
+
+        # Extract 2D patches from the 3D volume for T2W, DWI, DCE
+        # shape: (3, H, W)
+        patch_size = 64
+        half_patch = patch_size // 2
+
+        # Boundaries
+        z_idx = int(z)
+        x_min = max(0, int(x - half_patch))
+        x_max = min(self.max_x + 1, int(x + half_patch))
+        y_min = max(0, int(y - half_patch))
+        y_max = min(self.max_y + 1, int(y + half_patch))
+
+        # Extract patch
+        patch = self.volume[:, z_idx, y_min:y_max, x_min:x_max]
+
+        # Pad if necessary, we want the patch centered around x_idx, y_idx
+        # We need to calculate padding symmetrically based on bounds
+        pad_y_top = max(0, half_patch - int(y))
+        pad_y_bottom = max(0, int(y) + half_patch - self.max_y - 1)
+        pad_x_left = max(0, half_patch - int(x))
+        pad_x_right = max(0, int(x) + half_patch - self.max_x - 1)
+
+        if pad_y_top > 0 or pad_y_bottom > 0 or pad_x_left > 0 or pad_x_right > 0:
+            patch = np.pad(patch, ((0,0), (pad_y_top, pad_y_bottom), (pad_x_left, pad_x_right)), mode='constant')
+
+        # Add batch dimension and convert to tensor
+        patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0)
+
+        # Forward pass
+        with torch.no_grad():
+            fused_features, attention_map = self.integrated_model(patch_tensor)
+
+        # Return numpy array and attention map
+        return fused_features.squeeze(0).numpy(), attention_map.squeeze().numpy()
+
+    def _calculate_prostatex_scores(self, pos):
+        z, x, y = pos
+        overlap_score = 0.0
+        clinical_score = 0.0
+
+        threshold = 20.0
+        for lesion in self.lesions:
+            lz, lx, ly = lesion['coord'] # coord is now [idx_z, idx_x, idx_y]
+            dist = np.sqrt((z - lz)**2 + (y - ly)**2 + (x - lx)**2)
+            if dist < threshold:
+                overlap = 1.0 - (dist / threshold)
+                if overlap > overlap_score:
+                    overlap_score = overlap
+                    clinical_score = lesion['score']
+
+        return overlap_score, clinical_score
+
     def render(self, mode="save"):
+        if self.mode == "histogym":
+            return self._render_histogym(mode)
+        elif self.mode == "prostatex":
+            return self._render_prostatex(mode)
+
+    def _render_prostatex(self, mode):
+        if self.current_attention_map is not None and mode == "save":
+            # create directory if not exists
+            if not os.path.exists(self.result_path):
+                os.makedirs(self.result_path, exist_ok=True)
+
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            z, x, y = self.agent_pos
+            z_idx, x_idx, y_idx = int(z), int(x), int(y)
+            patch_size = 64
+            half = patch_size // 2
+
+            x_min = max(0, x_idx - half)
+            x_max = min(self.max_x + 1, x_idx + half)
+            y_min = max(0, y_idx - half)
+            y_max = min(self.max_y + 1, y_idx + half)
+
+            patch = self.volume[0, z_idx, y_min:y_max, x_min:x_max] # T2W
+            plt.imshow(patch, cmap='gray')
+            plt.title(f"T2W Patch pos {self.agent_pos}")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(self.current_attention_map, cmap='jet')
+            plt.title("Attention Heatmap")
+
+            save_path = f"{self.result_path}/prostatex_step_{self.count}.png"
+            plt.savefig(save_path)
+            plt.close()
+            print(f"Explainability visual saved to {save_path}")
+
+            if self.count % 10 == 0:
+                with open(f"{self.result_path}/trajectory.txt", "w") as tf:
+                    for p in self.trajectory:
+                        tf.write(f"{p}\n")
+
+        return None
+
+    def _render_histogym(self, mode="save"):
+
+
         """
         By Convention:
         - human: render to the current display or terminal and return nothing. Usually for human consumption.

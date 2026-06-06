@@ -92,6 +92,40 @@ pip install stable-baselines3[extra]
 
 
 
+
+## 1.4 ProstateX Extensions
+
+The repository has been extended to support the **ProstateX** dataset for MRI-guided prostate biopsy target selection.
+This requires loading T2W, DWI, and DCE modalities.
+
+### Install Additional Dependencies
+
+```bash
+pip install SimpleITK pandas torch torchvision
+```
+
+### Usage
+
+Use the `mode="prostatex"` parameter when initializing the `HistoEnv`.
+
+Example:
+
+```python
+from gymhisto import HistoEnv
+
+env = HistoEnv(
+    img_path="dummy",
+    xml_path="dummy",
+    tile_size=64,
+    result_path="./results",
+    mode="prostatex",
+    prostatex_data_dir="/path/to/ProstateX",
+    prostatex_metadata="/path/to/metadata.csv"
+)
+```
+
+See `train_ppo.py` for a full example of training an agent with PPO on the ProstateX dataset.
+
 # 2. Tutorial
 
 TODO: This Jupyter Notebook tutorial will guide you through the foundational concepts of HistoGym and provide step-by-step instructions on how to effectively utilize its features.
