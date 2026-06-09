@@ -29,16 +29,23 @@ import numpy as np
 import math
 from PIL import Image
 import matplotlib.pyplot as plt
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
+import random
 
-import openslide
-from openslide.deepzoom import DeepZoomGenerator
-from utils import coordination as Coor
+try:
+    import openslide
+    from openslide.deepzoom import DeepZoomGenerator
+    from utils import coordination as Coor
+    OPENSLIDE_AVAILABLE = True
+except ImportError:
+    OPENSLIDE_AVAILABLE = False
 
 # --- ProstateX Imports ---
 import SimpleITK as sitk
 from prostatex_dataset import ProstateXDataset
+# --- SARAS Imports ---
+from saras_dataset import SARASDataset
 from fusion_module import MultimodalFusion
 from attention_module import SpatialAttention, IntegratedFusionAttention
 import torch
@@ -119,7 +126,7 @@ class HistoEnv(gym.Env):
 
 
 
-    def __init__(self, img_path, xml_path, tile_size , result_path, mode="histogym", prostatex_data_dir=None, prostatex_metadata=None):
+    def __init__(self, img_path, xml_path, tile_size , result_path, mode="histogym", prostatex_data_dir=None, prostatex_metadata=None, saras_data_dir=None):
         super(HistoEnv, self).__init__()
         self.mode = mode
         
@@ -140,6 +147,9 @@ class HistoEnv(gym.Env):
             self.prostatex_data_dir = prostatex_data_dir
             self.prostatex_metadata = prostatex_metadata
             self._init_prostatex()
+        elif self.mode == "saras":
+            self.saras_data_dir = saras_data_dir
+            self._init_saras()
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -153,6 +163,8 @@ class HistoEnv(gym.Env):
 
 
     def _init_histogym(self):
+        if not OPENSLIDE_AVAILABLE:
+            raise ImportError("openslide is required for histogym mode")
         self.slide = openslide.OpenSlide(self.img_path)
         self.dz = DeepZoomGenerator(osr=self.slide, tile_size=self.tile_size, overlap=1, limit_bounds=False)
         self.dz_level = self._get_init_position()[0]
@@ -178,10 +190,15 @@ class HistoEnv(gym.Env):
         self.dataset = ProstateXDataset(self.prostatex_data_dir, self.prostatex_metadata)
 
         # Load patient data
-        patient_ids = [d for d in os.listdir(self.prostatex_data_dir) if os.path.isdir(os.path.join(self.prostatex_data_dir, d))]
-        if not patient_ids:
+        self.patient_ids = []
+        for file in os.listdir(self.prostatex_data_dir):
+            if file.startswith("ProstateX-") and file.endswith(".nii") and "Mask" not in file:
+                self.patient_ids.append(file.replace(".nii", ""))
+
+        if not self.patient_ids:
             raise FileNotFoundError("No patients found in ProstateX data dir")
-        self.patient_id = patient_ids[0]
+
+        self.patient_id = random.choice(self.patient_ids)
         self._load_patient(self.patient_id)
 
         self.n_actions = 9  # Added SLICE_UP and SLICE_DOWN
@@ -216,21 +233,62 @@ class HistoEnv(gym.Env):
         self.max_y = self.volume.shape[2] - 1
         self.max_x = self.volume.shape[3] - 1
 
+    def _init_saras(self):
+        print("Initializing SARAS Environment...")
+        self.dataset = SARASDataset(self.saras_data_dir)
+
+        if not self.dataset.frames:
+            raise FileNotFoundError("No frames found in SARAS data dir")
+
+        self.n_actions = 7  # UP, DOWN, LEFT, RIGHT, ZOOM_IN, ZOOM_OUT, STAY
+        self.action_space = spaces.Discrete(self.n_actions)
+
+        # Models
+        self.fusion_module = MultimodalFusion(in_channels=3, base_filters=16, out_features=128, is_3d=False)
+        self.attention_module = SpatialAttention(in_channels=64, is_3d=False)
+        self.integrated_model = IntegratedFusionAttention(self.fusion_module, self.attention_module)
+        self.integrated_model.eval()
+
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(128,), dtype=np.float32)
+
+        self.step_size = 20 # Step size in pixels
+        self.zoom_factor = 1.2
+        self.current_frame_path = random.choice(self.dataset.frames)
+        self._load_saras_frame(self.current_frame_path)
+        self.current_attention_map = None
+
+    def _load_saras_frame(self, frame_path):
+        self.frame, self.bboxes = self.dataset.get_frame_data(frame_path)
+        self.max_y = self.frame.shape[1] - 1
+        self.max_x = self.frame.shape[2] - 1
+
+        self.zoom_level = 1.0
+        self.patch_size = int(128 / self.zoom_level)
+
+        center_y = self.max_y // 2
+        center_x = self.max_x // 2
+        self.agent_pos = [center_x, center_y]
+
 
 
         
         
 
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         self.count = 0
+        info_dict = {}
 
         if self.mode == "histogym":
             self.agent_pos = self._get_init_position() #(z,x,y)
             self.state = self._get_state()
             self.bound = self._get_all_bound()
-            return self.state
+            return self.state, info_dict
         elif self.mode == "prostatex":
+            self.patient_id = random.choice(self.patient_ids)
+            self._load_patient(self.patient_id)
+
             self.visited_locations = set()
             self.trajectory = []
 
@@ -240,14 +298,25 @@ class HistoEnv(gym.Env):
             self.agent_pos = [center_z, center_x, center_y]
 
             self.state, self.current_attention_map = self._get_state_prostatex()
-            return self.state
+            return self.state, info_dict
+        elif self.mode == "saras":
+            self.current_frame_path = random.choice(self.dataset.frames)
+            self._load_saras_frame(self.current_frame_path)
+
+            self.state, self.current_attention_map = self._get_state_saras()
+            return self.state, info_dict
 
 
     def step(self,action):#action, agent_pos, n=1, tile_size = tile_size, init_z = init_z, plot = True
         if self.mode == "histogym":
-            return self._step_histogym(action)
+            obs, reward, done, info = self._step_histogym(action)
+            return obs, reward, done, False, info
         elif self.mode == "prostatex":
-            return self._step_prostatex(action)
+            obs, reward, done, info = self._step_prostatex(action)
+            return obs, reward, done, False, info
+        elif self.mode == "saras":
+            obs, reward, done, info = self._step_saras(action)
+            return obs, reward, done, False, info
             
     def _step_histogym(self, action):
 
@@ -448,12 +517,12 @@ class HistoEnv(gym.Env):
         duplicate_penalty = 0.0
         pos_tuple = tuple(self.agent_pos)
         if pos_tuple in self.visited_locations:
-            duplicate_penalty = 5.0
+            duplicate_penalty = 0.5
         else:
             self.visited_locations.add(pos_tuple)
             
         uncertainty_score = getattr(self, "current_uncertainty", 0.0)
-        step_penalty = 1.0
+        step_penalty = 0.01
 
         reward = (overlap_score * 500) + (clinical_score * 500) - step_penalty - duplicate_penalty
         reward += self.uncertainty_weight * uncertainty_score
@@ -526,11 +595,137 @@ class HistoEnv(gym.Env):
 
         return overlap_score, clinical_score
 
+    def _step_saras(self, action):
+        self.count += 1
+        x, y = self.agent_pos
+        step_x = int(self.step_size / self.zoom_level)
+        step_y = int(self.step_size / self.zoom_level)
+
+        if action == self.UP:
+            y = max(0, y - step_y)
+        elif action == self.DOWN:
+            y = min(self.max_y, y + step_y)
+        elif action == self.LEFT:
+            x = max(0, x - step_x)
+        elif action == self.RIGHT:
+            x = min(self.max_x, x + step_x)
+        elif action == self.ZOOM_IN:
+            self.zoom_level *= self.zoom_factor
+            self.patch_size = int(128 / self.zoom_level)
+        elif action == self.ZOOM_OUT:
+            self.zoom_level /= self.zoom_factor
+            self.patch_size = int(128 / self.zoom_level)
+        elif action == self.STAY:
+            pass
+
+        self.agent_pos = [x, y]
+        self.state, self.current_attention_map = self._get_state_saras()
+
+        # Calculate Reward based on IoU
+        overlap_score = self._calculate_saras_overlap()
+        step_penalty = 0.01
+
+        reward = overlap_score * 10 - step_penalty
+
+        done = False
+        if self.count >= self.max_step:
+            done = True
+
+        info = {
+            'overlap_score': overlap_score,
+            'position': self.agent_pos
+        }
+
+        return self.state, reward, done, info
+
+    def _get_state_saras(self):
+        x, y = self.agent_pos
+        half_patch = self.patch_size // 2
+
+        x_min = max(0, int(x - half_patch))
+        x_max = min(self.max_x + 1, int(x + half_patch))
+        y_min = max(0, int(y - half_patch))
+        y_max = min(self.max_y + 1, int(y + half_patch))
+
+        patch = self.frame[:, y_min:y_max, x_min:x_max]
+
+        # Pad if necessary
+        pad_y_top = max(0, half_patch - int(y))
+        pad_y_bottom = max(0, int(y) + half_patch - self.max_y - 1)
+        pad_x_left = max(0, half_patch - int(x))
+        pad_x_right = max(0, int(x) + half_patch - self.max_x - 1)
+
+        if pad_y_top > 0 or pad_y_bottom > 0 or pad_x_left > 0 or pad_x_right > 0:
+            patch = np.pad(patch, ((0,0), (pad_y_top, pad_y_bottom), (pad_x_left, pad_x_right)), mode='constant')
+
+        # Resize to 128x128 if patch_size is different due to zoom
+        if patch.shape[1] != 128 or patch.shape[2] != 128:
+            from PIL import Image
+            patch_img = Image.fromarray((patch.transpose(1, 2, 0) * 255).astype(np.uint8))
+            patch_img = patch_img.resize((128, 128))
+            patch = np.array(patch_img).transpose(2, 0, 1).astype(np.float32) / 255.0
+
+        patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            fused_features, attention_map = self.integrated_model(patch_tensor)
+
+        return fused_features.squeeze(0).numpy(), attention_map.squeeze().numpy()
+
+    def _calculate_saras_overlap(self):
+        x, y = self.agent_pos
+        half_patch = self.patch_size // 2
+
+        agent_xmin = x - half_patch
+        agent_xmax = x + half_patch
+        agent_ymin = y - half_patch
+        agent_ymax = y + half_patch
+
+        agent_area = (agent_xmax - agent_xmin) * (agent_ymax - agent_ymin)
+
+        max_iou = 0.0
+
+        for bbox_info in self.bboxes:
+            cx_rel, cy_rel, w_rel, h_rel = bbox_info['bbox']
+
+            # YOLO format is relative to image width/height
+            img_h, img_w = self.max_y + 1, self.max_x + 1
+            w = w_rel * img_w
+            h = h_rel * img_h
+            cx = cx_rel * img_w
+            cy = cy_rel * img_h
+
+            bbox_xmin = cx - w/2
+            bbox_xmax = cx + w/2
+            bbox_ymin = cy - h/2
+            bbox_ymax = cy + h/2
+
+            inter_xmin = max(agent_xmin, bbox_xmin)
+            inter_xmax = min(agent_xmax, bbox_xmax)
+            inter_ymin = max(agent_ymin, bbox_ymin)
+            inter_ymax = min(agent_ymax, bbox_ymax)
+
+            inter_w = max(0, inter_xmax - inter_xmin)
+            inter_h = max(0, inter_ymax - inter_ymin)
+
+            inter_area = inter_w * inter_h
+            bbox_area = w * h
+
+            union_area = agent_area + bbox_area - inter_area
+
+            iou = inter_area / union_area if union_area > 0 else 0
+            if iou > max_iou:
+                max_iou = iou
+
+        return max_iou
+
     def render(self, mode="save"):
         if self.mode == "histogym":
             return self._render_histogym(mode)
         elif self.mode == "prostatex":
             return self._render_prostatex(mode)
+        elif self.mode == "saras":
+            return self._render_saras(mode)
 
     def _render_prostatex(self, mode):
         if self.current_attention_map is not None and mode == "save":
@@ -567,6 +762,38 @@ class HistoEnv(gym.Env):
                 with open(f"{self.result_path}/trajectory.txt", "w") as tf:
                     for p in self.trajectory:
                         tf.write(f"{p}\n")
+
+        return None
+
+    def _render_saras(self, mode):
+        if self.current_attention_map is not None and mode == "save":
+            if not os.path.exists(self.result_path):
+                os.makedirs(self.result_path, exist_ok=True)
+
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            x, y = self.agent_pos
+            half = self.patch_size // 2
+
+            x_min = max(0, int(x - half))
+            x_max = min(self.max_x + 1, int(x + half))
+            y_min = max(0, int(y - half))
+            y_max = min(self.max_y + 1, int(y + half))
+
+            patch = self.frame[:, y_min:y_max, x_min:x_max]
+            # Convert back to (H, W, 3) for imshow
+            patch_rgb = np.transpose(patch, (1, 2, 0))
+            plt.imshow(patch_rgb)
+            plt.title(f"SARAS Patch pos {self.agent_pos}")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(self.current_attention_map, cmap='jet')
+            plt.title("Attention Heatmap")
+
+            save_path = f"{self.result_path}/saras_step_{self.count}.png"
+            plt.savefig(save_path)
+            plt.close()
+            print(f"Explainability visual saved to {save_path}")
 
         return None
 
