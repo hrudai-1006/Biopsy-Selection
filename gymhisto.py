@@ -29,8 +29,8 @@ import numpy as np
 import math
 from PIL import Image
 import matplotlib.pyplot as plt
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 import openslide
 from openslide.deepzoom import DeepZoomGenerator
@@ -222,14 +222,16 @@ class HistoEnv(gym.Env):
         
 
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
         self.count = 0
 
         if self.mode == "histogym":
             self.agent_pos = self._get_init_position() #(z,x,y)
             self.state = self._get_state()
             self.bound = self._get_all_bound()
-            return self.state
+            return self.state, {}
         elif self.mode == "prostatex":
             self.visited_locations = set()
             self.trajectory = []
@@ -240,7 +242,7 @@ class HistoEnv(gym.Env):
             self.agent_pos = [center_z, center_x, center_y]
 
             self.state, self.current_attention_map = self._get_state_prostatex()
-            return self.state
+            return self.state, {}
 
 
     def step(self,action):#action, agent_pos, n=1, tile_size = tile_size, init_z = init_z, plot = True
@@ -405,7 +407,7 @@ class HistoEnv(gym.Env):
             #return np.array([self.agent_pos]), reward, done, info
             # print(info, reward) # debug
             print(info, reward , self.overlap_ratio)  # debug
-            return self.state, reward, done, info
+            return self.state, float(reward), done, False, info
 
     # # def render(self, mode='console'):
     # #   if mode != 'console':
@@ -469,7 +471,7 @@ class HistoEnv(gym.Env):
             'position': self.agent_pos
         }
         
-        return self.state, reward, done, info
+        return self.state, float(reward), done, False, info
 
     def _get_state_prostatex(self):
         z, x, y = self.agent_pos

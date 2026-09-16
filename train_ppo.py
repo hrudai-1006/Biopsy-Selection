@@ -42,10 +42,10 @@ def main():
     print("Model saved to ppo_prostatex_model.zip")
 
     print("Running evaluation episode...")
-    obs = env.reset()
+    obs, _ = env.reset()
     for _ in range(50):
         action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, info = env.step(action)
+        obs, reward, done, truncated, info = env.step(action)
         env.render(mode="save")
         if done:
             break
