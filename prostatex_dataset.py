@@ -1,101 +1,107 @@
 import os
+import glob
 import numpy as np
-import pandas as pd
 import SimpleITK as sitk
 
 class ProstateXDataset:
     def __init__(self, data_dir, metadata_path=None):
         """
-        Initialize ProstateX dataset loader.
+        Initialize ProstateX dataset loader for flat directory structure.
 
         Args:
-            data_dir (str): Directory containing MRI patient folders.
-            metadata_path (str, optional): Path to metadata CSV with lesion info.
+            data_dir (str): Directory containing ProstateX-XXXX.nii and ProstateXMask-XXXX.nii files.
+            metadata_path (str, optional): Ignored. Kept for backwards compatibility in init signature.
         """
         self.data_dir = data_dir
-        self.metadata = None
-        if metadata_path and os.path.exists(metadata_path):
-            self.metadata = pd.read_csv(metadata_path)
+
+        # Discover all patient IDs based on image files
+        search_pattern = os.path.join(self.data_dir, "ProstateX-*.nii*")
+        img_files = glob.glob(search_pattern)
+
+        self.patient_ids = []
+        for f in img_files:
+            filename = os.path.basename(f)
+            # Extract XXXX from ProstateX-XXXX.nii or ProstateX-XXXX.nii.gz
+            pid = filename.split('.')[0].replace("ProstateX-", "")
+            self.patient_ids.append(pid)
+
+        self.patient_ids = sorted(list(set(self.patient_ids)))
 
     def get_patient_data(self, patient_id):
         """
-        Load T2W, DWI, and DCE volumes for a patient.
-        Aligns them to a common physical space (e.g., T2W's space).
+        Loads the single MRI volume and its corresponding mask.
+        Aligns mask to MRI, normalizes MRI, and extracts target region centroid.
         """
-        patient_dir = os.path.join(self.data_dir, patient_id)
-        if not os.path.exists(patient_dir):
-            raise FileNotFoundError(f"Patient directory not found: {patient_dir}")
+        img_path = self._find_file(f"ProstateX-{patient_id}.nii")
+        mask_path = self._find_file(f"ProstateXMask-{patient_id}.nii")
 
-        t2w_path = self._find_modality(patient_dir, 't2w')
-        dwi_path = self._find_modality(patient_dir, 'dwi')
-        dce_path = self._find_modality(patient_dir, 'dce')
+        if not img_path:
+            raise FileNotFoundError(f"Missing MRI for patient {patient_id}: expected ProstateX-{patient_id}.nii")
+        if not mask_path:
+            raise FileNotFoundError(f"Missing mask for patient {patient_id}: expected ProstateXMask-{patient_id}.nii")
 
-        t2w_img = sitk.ReadImage(t2w_path)
-        dwi_img = sitk.ReadImage(dwi_path)
-        dce_img = sitk.ReadImage(dce_path)
+        mri_img = sitk.ReadImage(img_path)
+        mask_img = sitk.ReadImage(mask_path)
 
-        # Resample and align DWI and DCE to T2W
-        dwi_aligned = self._resample_to_reference(dwi_img, t2w_img)
-        dce_aligned = self._resample_to_reference(dce_img, t2w_img)
-
-        # Normalize
-        t2w_norm = self._normalize(t2w_img)
-        dwi_norm = self._normalize(dwi_aligned)
-        dce_norm = self._normalize(dce_aligned)
-
-        # Extract numpy arrays (Z, Y, X)
-        t2w_np = sitk.GetArrayFromImage(t2w_norm)
-        dwi_np = sitk.GetArrayFromImage(dwi_norm)
-        dce_np = sitk.GetArrayFromImage(dce_norm)
-
-        # Stack to (3, Z, Y, X)
-        stacked = np.stack([t2w_np, dwi_np, dce_np], axis=0)
-
-        # Get lesions if available
-        lesions = []
-        if self.metadata is not None:
-            patient_lesions = self.metadata[self.metadata['ProxID'] == patient_id]
-            for _, row in patient_lesions.iterrows():
-                # ProstateX metadata gives physical points. Convert to index
-                # assuming pos_x, pos_y, pos_z are physical coordinates.
-                physical_point = (row['pos_x'], row['pos_y'], row['pos_z'])
-                index_point = t2w_img.TransformPhysicalPointToIndex(physical_point)
-
-                # SimpleITK returns index as (x, y, z), we need to ensure it maps to
-                # our environment agent_pos which is [z, x, y]
-                idx_x, idx_y, idx_z = index_point
-
-                score = row.get('ClinSig', row.get('PIRADS', 3)) # Default to moderate if not found
-                lesions.append({'coord': [idx_z, idx_x, idx_y], 'score': score})
-
-        return stacked, lesions, t2w_img # Returning image for metadata/spacing info
-
-    def _find_modality(self, patient_dir, modality):
-        """Helper to find the file for a specific modality."""
-        for root, dirs, files in os.walk(patient_dir):
-            for file in files:
-                if modality.lower() in file.lower() and file.endswith(('.nii.gz', '.mha', '.nrrd', '.dcm')):
-                    return os.path.join(root, file)
-        return os.path.join(patient_dir, f"{modality}.nii.gz")
-
-    def _resample_to_reference(self, image, reference):
-        """Resample an image to match the physical space of a reference image."""
+        # Resample mask into MRI's physical space using nearest neighbor (to preserve categorical mask values)
         resampler = sitk.ResampleImageFilter()
-        resampler.SetReferenceImage(reference)
-        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetReferenceImage(mri_img)
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor)
         resampler.SetDefaultPixelValue(0)
-        return resampler.Execute(image)
+        mask_aligned = resampler.Execute(mask_img)
+
+        # Verify alignment
+        if mri_img.GetSize() != mask_aligned.GetSize():
+            raise ValueError(f"Alignment failed for {patient_id}: sizes differ.")
+
+        # Normalize MRI
+        mri_norm = self._normalize(mri_img)
+
+        # Convert to numpy arrays (Z, Y, X)
+        mri_np = sitk.GetArrayFromImage(mri_norm)
+        mask_np = sitk.GetArrayFromImage(mask_aligned)
+
+        # Create single-channel volume: (1, Z, Y, X)
+        volume = np.expand_dims(mri_np, axis=0)
+
+        # Extract target region (prostate/lesion centroid) from mask
+        # Note: We find the centroid of all non-zero voxels in the mask.
+        targets = []
+        non_zero_coords = np.argwhere(mask_np > 0)
+
+        if len(non_zero_coords) > 0:
+            centroid_z = int(np.mean(non_zero_coords[:, 0]))
+            centroid_y = int(np.mean(non_zero_coords[:, 1]))
+            centroid_x = int(np.mean(non_zero_coords[:, 2]))
+
+            # Map to agent_pos convention [z, x, y]
+            # SimpleITK numpy array is (z, y, x). Our env expects (z, x, y) conceptually,
+            # where the last two dims are spatial W, H. Let's trace gymhisto:
+            # env.agent_pos = [z, x, y].
+            targets.append({
+                'coord': [centroid_z, centroid_x, centroid_y],
+                'score': 3 # Default clinical score representing generic target
+            })
+
+        return volume, targets, mri_img
+
+    def _find_file(self, filename_prefix):
+        """Finds a file matching the prefix (handling .nii or .nii.gz)."""
+        pattern = os.path.join(self.data_dir, f"{filename_prefix}*")
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+        return None
 
     def _normalize(self, image):
-        """Normalize image intensities (e.g., Z-score or min-max)."""
+        """Normalize image intensities using Z-score."""
         img_float = sitk.Cast(image, sitk.sitkFloat32)
-        mean, std = self._get_image_stats(img_float)
+        stats = sitk.StatisticsImageFilter()
+        stats.Execute(img_float)
+        mean, std = stats.GetMean(), stats.GetSigma()
+
         if std == 0:
             return img_float
+
         normalized = sitk.ShiftScale(img_float, shift=-mean, scale=1.0/std)
         return normalized
-
-    def _get_image_stats(self, image):
-        stats = sitk.StatisticsImageFilter()
-        stats.Execute(image)
-        return stats.GetMean(), stats.GetSigma()

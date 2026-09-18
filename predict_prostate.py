@@ -10,7 +10,7 @@ import cv2
 import shutil
 
 def load_and_preprocess_nii(nii_path):
-    """Loads a single .nii file, normalizes it, and stacks it 3x to simulate modalities."""
+    """Loads a single .nii file and normalizes it."""
     img = sitk.ReadImage(nii_path)
     img_float = sitk.Cast(img, sitk.sitkFloat32)
     stats = sitk.StatisticsImageFilter()
@@ -23,21 +23,21 @@ def load_and_preprocess_nii(nii_path):
 
     np_img = sitk.GetArrayFromImage(normalized)
 
-    # Stack 3 times to simulate T2W, DWI, DCE
-    stacked = np.stack([np_img, np_img, np_img], axis=0)
+    # New loader expects (1, Z, Y, X)
+    stacked = np.expand_dims(np_img, axis=0)
     return stacked, sitk.GetArrayFromImage(img)
 
 class DummyProstateXDataset:
-    def __init__(self, stacked_mri):
-        self.stacked_mri = stacked_mri
+    def __init__(self, volume_mri):
+        self.volume_mri = volume_mri
+        self.patient_ids = ["MockPatient"]
 
     def get_patient_data(self, patient_id):
-        # We just return the pre-loaded, stacked MRI, empty lesions, and None for img
-        return self.stacked_mri, [], None
-
+        # We just return the pre-loaded, stacked MRI, empty targets, and None for img
+        return self.volume_mri, [], None
 
 def main():
-    parser = argparse.ArgumentParser(description="Predict Prostate Lesion using PPO Agent")
+    parser = argparse.ArgumentParser(description="Predict Prostate Target using PPO Agent")
     parser.add_argument('--input_nii', type=str, required=True, help="Path to input MRI .nii or .nii.gz file")
     parser.add_argument('--model_path', type=str, required=True, help="Path to the trained PPO model (.zip)")
     parser.add_argument('--output_dir', type=str, default="./predictions", help="Directory to save the prediction image")
@@ -47,32 +47,23 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Loading MRI scan from {args.input_nii}...")
-    stacked_mri, original_mri = load_and_preprocess_nii(args.input_nii)
+    volume_mri, original_mri = load_and_preprocess_nii(args.input_nii)
 
     # Create an empty mock directory to pass initialization check
-    # HistoEnv will not use it because we override the dataset
     mock_dir = "temp_mock_prostatex"
     patient_id = "MockPatient"
-    patient_dir = os.path.join(mock_dir, patient_id)
-    os.makedirs(patient_dir, exist_ok=True)
-    sitk.WriteImage(sitk.GetImageFromArray(stacked_mri[0]), os.path.join(patient_dir, "t2w.nii.gz"))
-    sitk.WriteImage(sitk.GetImageFromArray(stacked_mri[1]), os.path.join(patient_dir, "dwi.nii.gz"))
-    sitk.WriteImage(sitk.GetImageFromArray(stacked_mri[2]), os.path.join(patient_dir, "dce.nii.gz"))
-
-    patient_id = "MockPatient"
-    os.makedirs(os.path.join(mock_dir, patient_id), exist_ok=True)
+    os.makedirs(mock_dir, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(volume_mri[0]), os.path.join(mock_dir, f"ProstateX-{patient_id}.nii"))
+    sitk.WriteImage(sitk.GetImageFromArray(volume_mri[0]), os.path.join(mock_dir, f"ProstateXMask-{patient_id}.nii"))
 
     try:
-        # Note: the older gym API vs gymnasium API can cause unpack errors if not handled correctly.
-        # HistoEnv currently uses gymnasium (we patched it), but some old gym imports might remain in stable_baselines3.
-        # It's safest to rely on the fact that HistoGym takes these parameters.
         env = HistoEnv(
             img_path="dummy", xml_path="dummy", tile_size=64, result_path=args.output_dir,
-            mode="prostatex", prostatex_data_dir=mock_dir, prostatex_metadata=None
+            mode="prostatex", prostatex_data_dir=mock_dir
         )
 
         # Override the dataset with our dummy dataset containing the raw MRI
-        env.dataset = DummyProstateXDataset(stacked_mri)
+        env.dataset = DummyProstateXDataset(volume_mri)
 
         # We need to manually call load patient since we bypass standard logic
         env.patient_id = patient_id
@@ -143,7 +134,7 @@ def main():
         # Bounding box
         rect = patches.Rectangle((x - env.tile_size//2, y - env.tile_size//2), env.tile_size, env.tile_size, linewidth=2, edgecolor='r', facecolor='none')
         ax.add_patch(rect)
-        ax.set_title(f"Predicted Biopsy Site (Slice {z})")
+        ax.set_title(f"Predicted Biopsy Target (Slice {z})")
         ax.axis('off')
 
         out_path = os.path.join(args.output_dir, f"prediction_slice_{z}.png")

@@ -119,7 +119,7 @@ class HistoEnv(gym.Env):
 
 
 
-    def __init__(self, img_path, xml_path, tile_size , result_path, mode="histogym", prostatex_data_dir=None, prostatex_metadata=None):
+    def __init__(self, img_path, xml_path, tile_size , result_path, mode="histogym", prostatex_data_dir=None, ):
         super(HistoEnv, self).__init__()
         self.mode = mode
         
@@ -138,7 +138,7 @@ class HistoEnv(gym.Env):
             self._init_histogym()
         elif self.mode == "prostatex":
             self.prostatex_data_dir = prostatex_data_dir
-            self.prostatex_metadata = prostatex_metadata
+
             self._init_prostatex()
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
@@ -175,10 +175,10 @@ class HistoEnv(gym.Env):
         self.bound = self._get_all_bound()
     def _init_prostatex(self):
         print("Initializing ProstateX Environment...")
-        self.dataset = ProstateXDataset(self.prostatex_data_dir, self.prostatex_metadata)
+        self.dataset = ProstateXDataset(self.prostatex_data_dir)
 
         # Load patient data
-        patient_ids = [d for d in os.listdir(self.prostatex_data_dir) if os.path.isdir(os.path.join(self.prostatex_data_dir, d))]
+        patient_ids = self.dataset.patient_ids
         if not patient_ids:
             raise FileNotFoundError("No patients found in ProstateX data dir")
         self.patient_id = patient_ids[0]
@@ -188,7 +188,7 @@ class HistoEnv(gym.Env):
         self.action_space = spaces.Discrete(self.n_actions)
 
         # Models
-        self.fusion_module = MultimodalFusion(in_channels=3, base_filters=16, out_features=128, is_3d=False)
+        self.fusion_module = MultimodalFusion(in_channels=1, base_filters=16, out_features=128, is_3d=False)
         self.attention_module = SpatialAttention(in_channels=64, is_3d=False) # 64 is base_filters*4
         self.integrated_model = IntegratedFusionAttention(self.fusion_module, self.attention_module)
         self.integrated_model.eval()
@@ -211,7 +211,7 @@ class HistoEnv(gym.Env):
         self.current_attention_map = None
 
     def _load_patient(self, patient_id):
-        self.volume, self.lesions, self.img_info = self.dataset.get_patient_data(patient_id)
+        self.volume, self.targets, self.img_info = self.dataset.get_patient_data(patient_id)
         self.max_z = self.volume.shape[1] - 1
         self.max_y = self.volume.shape[2] - 1
         self.max_x = self.volume.shape[3] - 1
@@ -517,14 +517,14 @@ class HistoEnv(gym.Env):
         clinical_score = 0.0
 
         threshold = 20.0
-        for lesion in self.lesions:
-            lz, lx, ly = lesion['coord'] # coord is now [idx_z, idx_x, idx_y]
+        for target in self.targets:
+            lz, lx, ly = target['coord'] # coord is now [idx_z, idx_x, idx_y]
             dist = np.sqrt((z - lz)**2 + (y - ly)**2 + (x - lx)**2)
             if dist < threshold:
                 overlap = 1.0 - (dist / threshold)
                 if overlap > overlap_score:
                     overlap_score = overlap
-                    clinical_score = lesion['score']
+                    clinical_score = target['score']
 
         return overlap_score, clinical_score
 
