@@ -84,7 +84,7 @@ def run_evaluation():
 
     # Initialize environment
     env = HistoEnv(
-        img_path="dummy", xml_path="dummy", tile_size=64, result_path="./tmp",
+        tile_size=64, result_path="./tmp",
         mode="prostatex", prostatex_data_dir=DATA_DIR
     )
 
