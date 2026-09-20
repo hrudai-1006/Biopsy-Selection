@@ -15,8 +15,8 @@ def main():
         return
 
     env = HistoEnv(
-        img_path="dummy.tif",
-        xml_path="dummy.xml",
+        img_path=None,
+        xml_path=None,
         tile_size=64,
         result_path="./prostatex_results",
         mode="prostatex",
