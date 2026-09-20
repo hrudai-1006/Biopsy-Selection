@@ -540,25 +540,36 @@ class HistoEnv(gym.Env):
             if not os.path.exists(self.result_path):
                 os.makedirs(self.result_path, exist_ok=True)
 
-            plt.figure(figsize=(10, 5))
-            plt.subplot(1, 2, 1)
             z, x, y = self.agent_pos
             z_idx, x_idx, y_idx = int(z), int(x), int(y)
-            patch_size = 64
-            half = patch_size // 2
 
-            x_min = max(0, x_idx - half)
-            x_max = min(self.max_x + 1, x_idx + half)
-            y_min = max(0, y_idx - half)
-            y_max = min(self.max_y + 1, y_idx + half)
+            # Display the full MRI slice with a bounding box rather than just the patch
+            slice_img = self.volume[0, z_idx, :, :]
+            h, w = slice_img.shape
 
-            patch = self.volume[0, z_idx, y_min:y_max, x_min:x_max] # T2W
-            plt.imshow(patch, cmap='gray')
-            plt.title(f"T2W Patch pos {self.agent_pos}")
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
 
-            plt.subplot(1, 2, 2)
-            plt.imshow(self.current_attention_map, cmap='jet')
-            plt.title("Attention Heatmap")
+            # --- Panel 1: Original slice with bounding box ---
+            ax1.imshow(slice_img, cmap='gray')
+
+            # Draw bounding box for the patch
+            half = self.tile_size // 2
+            import matplotlib.patches as patches
+            rect = patches.Rectangle((x_idx - half, y_idx - half), self.tile_size, self.tile_size, linewidth=2, edgecolor='r', facecolor='none')
+            ax1.add_patch(rect)
+
+            # Draw center point
+            ax1.plot(x_idx, y_idx, 'go', markersize=5)
+
+            # Add label
+            ax1.text(max(0, x_idx - half), max(0, y_idx - half - 5), "Predicted Biopsy Position", color='red', fontsize=12, backgroundcolor='white')
+
+            ax1.set_title(f"Predicted Position Marked\npos [{z_idx}, {x_idx}, {y_idx}]")
+            ax1.axis('off')
+
+            # --- Panel 2: Attention Heatmap ---
+            ax2.imshow(self.current_attention_map, cmap='jet')
+            ax2.set_title("Attention Heatmap")
 
             save_path = f"{self.result_path}/prostatex_step_{self.count}.png"
             plt.savefig(save_path)
